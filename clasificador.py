@@ -1,10 +1,11 @@
+import numpy as np
+
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score
 
 from Dynamic_Time_Warping import compute_dtw_matrix, compute_dtw_test_matrix
-
 
 
 class ClasificadorSeriesTiempo:
@@ -31,10 +32,8 @@ class ClasificadorSeriesTiempo:
 
         if self.usar_precomputada:
             self.knn.fit(X_entrenamiento, y_entrenamiento)
-
             K_entrenamiento = self.transformar_a_kernel(X_entrenamiento)
             self.svm.fit(K_entrenamiento, y_entrenamiento)
-
             if X_original is None:
                 raise ValueError("Se requiere X_original para el árbol.")
             self.arbol.fit(X_original, y_entrenamiento)
@@ -48,10 +47,8 @@ class ClasificadorSeriesTiempo:
 
         if self.usar_precomputada:
             pred_knn = self.knn.predict(X_prueba)
-
             K_prueba = self.transformar_a_kernel(X_prueba)
             pred_svm = self.svm.predict(K_prueba)
-
             if X_original_prueba is None:
                 raise ValueError("Se requiere X_original_prueba para el árbol.")
             pred_arbol = self.arbol.predict(X_original_prueba)
@@ -63,12 +60,23 @@ class ClasificadorSeriesTiempo:
 
         return pred_knn, pred_svm, pred_arbol
 
+    def _metricas(self, y_true, y_pred):
+
+        acc = accuracy_score(y_true, y_pred)
+        error = 1 - acc
+        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+        return {
+            "accuracy": acc,
+            "error": error,
+            "precision": precision,
+            "recall": recall
+        }
     def evaluar(self, X_prueba, y_prueba, X_original_prueba=None):
 
         pred_knn, pred_svm, pred_arbol = self.predecir(X_prueba, X_original_prueba)
-
         return {
-            "KNN": 1 - accuracy_score(y_prueba, pred_knn),
-            "SVM": 1 - accuracy_score(y_prueba, pred_svm),
-            "Arbol": 1 - accuracy_score(y_prueba, pred_arbol)
+            "KNN": self._metricas(y_prueba, pred_knn),
+            "SVM": self._metricas(y_prueba, pred_svm),
+            "Arbol": self._metricas(y_prueba, pred_arbol)
         }
