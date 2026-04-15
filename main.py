@@ -11,7 +11,95 @@ def convert_ts(path):
     return train, test
 
 
-if __name__ == "__main__":
+def NMC(mu, sigma, tau=None):
+    n = len(mu)
+    
+    P = np.zeros((n, 2, 2))
+    P[:, 0, 0] = (sigma + mu**2) / sigma
+    P[:, 0, 1] = mu / sigma
+    P[:, 1, 0] = mu / sigma
+    P[:, 1, 1] = 1 / sigma
+
+    eigvals, eigvecs = np.linalg.eigh(P)
+    eigvals = np.clip(eigvals, 1e-12, None)
+
+    D_inv_sqrt = np.zeros_like(P)
+    D_inv_sqrt[:, 0, 0] = 1 / np.sqrt(eigvals[:, 0])
+    D_inv_sqrt[:, 1, 1] = 1 / np.sqrt(eigvals[:, 1])
+
+    P_inv_sqrt = eigvecs @ D_inv_sqrt @ np.transpose(eigvecs, (0, 2, 1))
+
+    M = P_inv_sqrt[:, None] @ P[None, :] @ P_inv_sqrt[:, None]
+
+    eigvals_M = np.linalg.eigh(M)[0]
+    eigvals_M = np.clip(eigvals_M, 1e-12, None)
+
+    A = np.sum(np.log(eigvals_M)**2, axis=-1)  # (n, n)
+
+    if tau is not None:
+        A = np.where(A > tau, A, 0.0)
+
+    return A
+
+import numpy as np
+
+def transform_networks(A, lamb, return_tangent=True):
+    """
+    A_all: array (K, n, n)  -> matrices de adyacencia A_k
+    lam: float > 0
+    return_tangent: si True, también retorna proyección en espacio tangente
+
+    Returns:
+        L_all: (K, n, n) matrices SPD
+        Y_all: (K, n, n) proyecciones (opcional)
+        M: (n, n) media SPD (opcional)
+    """
+    
+    K, n, _ = A.shape
+
+    degrees = np.sum(A, axis=2)              # (K, n)
+    D = np.zeros_like(A)
+    idx = np.arange(n)
+    D[:, idx, idx] = degrees
+
+    L = D - A + lamb * np.eye(n)[None, :, :]
+
+    if not return_tangent:
+        return L
+
+    eigvals, eigvecs = np.linalg.eigh(L)
+    eigvals = np.clip(eigvals, 1e-12, None)
+
+    log_eigvals = np.log(eigvals)
+
+    Log_L = eigvecs @ np.stack([
+        np.diag(log_eigvals[k]) for k in range(K)
+    ]) @ np.transpose(eigvecs, (0, 2, 1))
+
+    Log_M = np.mean(Log_L, axis=0)
+
+    # exponencial de la media
+    eigvals_M, eigvecs_M = np.linalg.eigh(Log_M)
+    M = eigvecs_M @ np.diag(np.exp(eigvals_M)) @ eigvecs_M.T
+
+    eigvals_M = np.clip(eigvals_M, 1e-12, None)
+    M_inv_sqrt = eigvecs_M @ np.diag(1/np.sqrt(eigvals_M)) @ eigvecs_M.T
+    M_sqrt = eigvecs_M @ np.diag(np.sqrt(eigvals_M)) @ eigvecs_M.T
+
+    temp = M_inv_sqrt[None, :, :] @ L @ M_inv_sqrt[None, :, :]
+
+    eigvals_t, eigvecs_t = np.linalg.eigh(temp)
+    eigvals_t = np.clip(eigvals_t, 1e-12, None)
+
+    log_temp = eigvecs_t @ np.stack([
+        np.diag(np.log(eigvals_t[k])) for k in range(K)
+    ]) @ np.transpose(eigvecs_t, (0, 2, 1))
+
+    Y = M_sqrt[None, :, :] @ log_temp @ M_sqrt[None, :, :]
+
+    return L, Y, M
+
+if __name__ == "__main__":  
     datasets = [
         "ArrowHead",
         "Beef",
