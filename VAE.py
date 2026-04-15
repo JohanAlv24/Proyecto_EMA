@@ -32,8 +32,12 @@ __all__ = [
     "TimeSeriesVAE",
     "VAETrainer",
     "load_ucr_dataset",
+    "preprocess_ucr_series",
     "build_global_ucr_matrix",
     "build_ecg5000_paper_split",
+    "mean_absolute_percentage_error",
+    "mape_original_scale",
+    "train_single_dataset"
 ]
 
 
@@ -122,6 +126,32 @@ def _zscore(X: np.ndarray) -> np.ndarray:
     return (X - mean) / std
 
 
+def _get_series_statistics(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute mean and std for each series before normalization.
+    
+    Returns:
+        (means, stds) where means and stds have shape (n_samples, 1).
+    """
+    mean = X.mean(axis=1, keepdims=True)
+    std = X.std(axis=1, keepdims=True)
+    std = np.where(std == 0, 1.0, std)
+    return mean, std
+
+
+def _unzscore(X_normalized: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Reverse Z-score normalization to recover original scale.
+    
+    Args:
+        X_normalized: Normalized series of shape (n_samples, series_length).
+        mean: Per-series means of shape (n_samples, 1).
+        std: Per-series stds of shape (n_samples, 1).
+    
+    Returns:
+        Series in original scale.
+    """
+    return X_normalized * std + mean
+
+
 def _pad_or_truncate(X: np.ndarray, target_length: int) -> np.ndarray:
     """Pad with zeros on the right or truncate each row to target_length."""
 
@@ -138,6 +168,88 @@ def _preprocess(X: np.ndarray, target_length: int) -> np.ndarray:
     """Z-score then pad / truncate to target_length."""
 
     return _pad_or_truncate(_zscore(X), target_length)
+
+
+def preprocess_ucr_series(X: np.ndarray, target_length: int) -> np.ndarray:
+    """Public wrapper for time-series preprocessing used across scripts."""
+
+    return _preprocess(X, target_length)
+
+
+def mean_absolute_percentage_error(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    epsilon: float = 1e-8,
+) -> float:
+    """Compute Symmetric MAPE (sMAPE %) using per-series averaging.
+    
+    sMAPE formula: 2 * |y_true - y_pred| / (|y_true| + |y_pred|)
+    Range: [0, 200%] — stable near zero, no denominador explosion.
+    
+    Each series gets one sMAPE value by averaging along time, and the final value
+    is the mean across all series.
+    """
+
+    y_true_arr = np.asarray(y_true, dtype=np.float32)
+    y_pred_arr = np.asarray(y_pred, dtype=np.float32)
+
+    if y_true_arr.shape != y_pred_arr.shape:
+        raise ValueError(
+            f"y_true and y_pred must have the same shape, got "
+            f"{y_true_arr.shape} and {y_pred_arr.shape}"
+        )
+    if y_true_arr.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D arrays (n_series, series_length), got {y_true_arr.ndim}-D"
+        )
+    if y_true_arr.shape[0] == 0:
+        return float("nan")
+
+    numerator =  np.abs(y_true_arr - y_pred_arr)
+    denominator = np.abs(y_true_arr) + np.abs(y_pred_arr) + epsilon
+    per_point = numerator / denominator
+    per_series = per_point.mean(axis=1)
+    return float(per_series.mean() * 100.0)
+
+
+def mape_original_scale(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    epsilon: float = 1e-8,
+) -> float:
+    """Compute MAPE (Mean Absolute Percentage Error) in original scale.
+    
+    MAPE formula: 100 * mean(|y_true - y_pred| / (|y_true| + epsilon))
+    Stable for values near zero with epsilon regularization.
+    
+    Args:
+        y_true: Ground truth in original scale, shape (n_series, series_length).
+        y_pred: Predictions in original scale, shape (n_series, series_length).
+        epsilon: Small constant to avoid division by zero.
+    
+    Returns:
+        MAPE percentage value.
+    """
+    y_true_arr = np.asarray(y_true, dtype=np.float32)
+    y_pred_arr = np.asarray(y_pred, dtype=np.float32)
+    
+    if y_true_arr.shape != y_pred_arr.shape:
+        raise ValueError(
+            f"y_true and y_pred must have the same shape, got "
+            f"{y_true_arr.shape} and {y_pred_arr.shape}"
+        )
+    if y_true_arr.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D arrays (n_series, series_length), got {y_true_arr.ndim}-D"
+        )
+    if y_true_arr.shape[0] == 0:
+        return float("nan")
+    
+    numerator = np.abs(y_true_arr - y_pred_arr)
+    denominator = np.abs(y_true_arr) + epsilon
+    per_point = numerator / denominator
+    per_series = per_point.mean(axis=1)
+    return float(per_series.mean() * 100.0)
 
 
 def build_global_ucr_matrix(
@@ -411,8 +523,13 @@ class VAETrainer:
     # Core loops
     # ------------------------------------------------------------------
 
-    def train_epoch(self, loader: DataLoader) -> float:
-        """Run one full training epoch over loader and return mean sample loss."""
+    def train_epoch(self, loader: DataLoader, beta: float = 1.0) -> float:
+        """Run one full training epoch over loader and return mean sample loss.
+        
+        Args:
+            loader: DataLoader with training batches.
+            beta: KL divergence weight multiplier (for warm-up schedule).
+        """
 
         self.model.train()
         total_loss, n = 0.0, 0
@@ -421,7 +538,7 @@ class VAETrainer:
             if batch.dim() == 2:
                 batch = batch.unsqueeze(1)
             x_recon, mu, sigma, _ = self.model(batch)
-            loss = self.model.loss_function(batch, x_recon, mu, sigma)
+            loss = self.model.loss_function(batch, x_recon, mu, sigma, beta=beta)
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -453,8 +570,19 @@ class VAETrainer:
         val_split: float = 0.1,
         verbose: bool = True,
         early_stopping_patience: int = 0,
+        kl_warmup_epochs: int = 25,
     ) -> Dict[str, list]:
-        """Train the VAE on a numpy array of pre-processed time series."""
+        """Train the VAE on a numpy array of pre-processed time series.
+        
+        Args:
+            X: Training data (n_samples, input_length).
+            epochs: Number of training epochs.
+            batch_size: Batch size for training and validation.
+            val_split: Fraction of data to use for validation.
+            verbose: Whether to print training progress.
+            early_stopping_patience: Number of epochs with no improvement to stop. 0 disables.
+            kl_warmup_epochs: Number of epochs to linearly warm up KL term (default 25).
+        """
 
         if X.ndim != 2 or X.shape[1] != self.model.config.input_length:
             raise ValueError(
@@ -486,7 +614,10 @@ class VAETrainer:
         patience_count = 0
 
         for epoch in range(1, epochs + 1):
-            tr = self.train_epoch(train_loader)
+            # Compute KL warm-up schedule: β grows linearly from 0 to 1 over kl_warmup_epochs
+            beta = min(1.0, epoch / max(1, kl_warmup_epochs))
+            
+            tr = self.train_epoch(train_loader, beta=beta)
             history["train_loss"].append(tr)
             val_str = ""
 
@@ -506,9 +637,46 @@ class VAETrainer:
                         break
 
             if verbose:
-                print(f"Epoch [{epoch:>4}/{epochs}]  train_loss={tr:.4f}{val_str}")
+                print(f"Epoch [{epoch:>4}/{epochs}]  train_loss={tr:.4f}{val_str}  (beta={beta:.4f})")
 
         return history
+
+    def reconstruct(self, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
+        """Reconstruct a 2-D matrix of time series and return numpy output."""
+
+        expected_len = self.model.config.input_length
+        if X.ndim != 2 or X.shape[1] != expected_len:
+            raise ValueError(
+                f"X must have shape (n_samples, {expected_len}), got {X.shape}"
+            )
+
+        dataset = TensorDataset(torch.from_numpy(X.astype(np.float32)))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        self.model.eval()
+        recon_parts: List[np.ndarray] = []
+        with torch.no_grad():
+            for (batch,) in loader:
+                batch = batch.to(self.device)
+                if batch.dim() == 2:
+                    batch = batch.unsqueeze(1)
+                x_recon, _, _, _ = self.model(batch)
+                recon_parts.append(x_recon.squeeze(1).cpu().numpy())
+
+        if not recon_parts:
+            return np.empty((0, expected_len), dtype=np.float32)
+        return np.concatenate(recon_parts, axis=0).astype(np.float32)
+
+    def reconstruction_mape(
+        self,
+        X: np.ndarray,
+        batch_size: int = 256,
+        epsilon: float = 1e-8,
+    ) -> float:
+        """Compute MAPE (%) between X and its VAE reconstruction."""
+
+        X_recon = self.reconstruct(X, batch_size=batch_size)
+        return mean_absolute_percentage_error(X, X_recon, epsilon=epsilon)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -554,3 +722,149 @@ class VAETrainer:
             )
         self.model.load_state_dict(checkpoint["state_dict"])
         self.model.to(self.device)
+
+
+# ---------------------------------------------------------------------------
+# Entrenamiento de un único dataset UCR
+# ---------------------------------------------------------------------------
+
+
+def train_single_dataset(
+    name: str,
+    archive_path: str,
+    config: Dict[str, object],
+    device: str,
+    seed: int,
+) -> Dict[str, object]:
+    """Entrena un VAE sobre un único dataset UCR y devuelve sus métricas en escala original."""
+    import torch
+
+    X_tr, _, X_te, _ = load_ucr_dataset(name, archive_path)
+    natural_length = int(X_tr.shape[1])
+    target_length = int(config["target_length"])
+    series_length = min(target_length, natural_length) if target_length > 0 else natural_length
+
+    # Truncate/pad to series_length BEFORE capturing statistics
+    X_tr_padded = _pad_or_truncate(X_tr, series_length)
+    X_te_padded = _pad_or_truncate(X_te, series_length)
+
+    # Capture mean and std for each series in original scale BEFORE normalization
+    means_tr, stds_tr = _get_series_statistics(X_tr_padded)
+    means_te, stds_te = _get_series_statistics(X_te_padded)
+
+    # Now normalize
+    X_tr_orig_padded = X_tr_padded.copy()  # Keep copy for later denormalization
+    X_te_orig_padded = X_te_padded.copy()
+    X_tr_norm = (X_tr_padded - means_tr) / stds_tr
+    X_te_norm = (X_te_padded - means_te) / stds_te
+
+    use_paper_split = bool(config["paper_ecg5000_split"]) and name == "ECG5000"
+    if use_paper_split:
+        paper_len = min(series_length, 140)
+        X_train_arr, _, _, _ = build_ecg5000_paper_split(
+            archive_path=archive_path,
+            target_length=paper_len,
+            seed=seed,
+        )
+        # For paper split, recalculate stats for the actual training set
+        X_tr_eval = X_tr_norm[:, :paper_len]
+        X_te_eval = X_te_norm[:, :paper_len]
+        means_tr = means_tr[:, :paper_len] if means_tr.shape[1] > paper_len else means_tr
+        stds_tr = stds_tr[:, :paper_len] if stds_tr.shape[1] > paper_len else stds_tr
+        means_te = means_te[:, :paper_len] if means_te.shape[1] > paper_len else means_te
+        stds_te = stds_te[:, :paper_len] if stds_te.shape[1] > paper_len else stds_te
+        series_length = paper_len
+    else:
+        X_tr_eval = X_tr_norm
+        X_te_eval = X_te_norm
+        if bool(config["use_test"]):
+            X_train_arr = np.concatenate([X_tr_eval, X_te_eval], axis=0)
+        else:
+            X_train_arr = X_tr_eval
+
+    print(
+        f"  Longitud de serie: {series_length} (natural: {natural_length})"
+        f"  |  Train: {len(X_train_arr)}  |  Test: {len(X_te_eval)}"
+    )
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    cfg = TimeSeriesVAEConfig(
+        input_length=series_length,
+        latent_dim=int(config["latent_dim"]),
+        hidden_size=int(config["hidden_size"]),
+        num_layers=int(config["num_layers"]),
+        beta=float(config["beta"]),
+    )
+    model = TimeSeriesVAE(cfg)
+    trainer = VAETrainer(
+        model=model,
+        learning_rate=float(config["learning_rate"]),
+        device=device,
+    )
+
+    history = trainer.fit(
+        X_train_arr,
+        epochs=int(config["epochs"]),
+        batch_size=int(config["batch_size"]),
+        val_split=float(config["val_split"]),
+        verbose=True,
+        early_stopping_patience=int(config["early_stopping_patience"]),
+        kl_warmup_epochs=25,  # Default warm-up schedule
+    )
+
+    batch = int(config["batch_size"])
+    
+    # Reconstruct in normalized space
+    X_recon_tr_norm = trainer.reconstruct(X_tr_eval, batch_size=batch)
+    X_recon_te_norm = trainer.reconstruct(X_te_eval, batch_size=batch)
+    X_total_norm = np.concatenate([X_tr_eval, X_te_eval], axis=0)
+    X_recon_total_norm = trainer.reconstruct(X_total_norm, batch_size=batch)
+
+    # Denormalize reconstructions and originals to original scale
+    X_tr_orig = X_tr_orig_padded  # Original scale, padded
+    X_te_orig = X_te_orig_padded
+    X_recon_tr_orig = _unzscore(X_recon_tr_norm, means_tr, stds_tr)
+    X_recon_te_orig = _unzscore(X_recon_te_norm, means_te, stds_te)
+    X_total_orig = np.concatenate([X_tr_orig, X_te_orig], axis=0)
+    X_recon_total_orig = np.concatenate([X_recon_tr_orig, X_recon_te_orig], axis=0)
+
+    # Calculate MAPE in original scale
+    mape_train = mape_original_scale(X_tr_orig, X_recon_tr_orig)
+    mape_test = mape_original_scale(X_te_orig, X_recon_te_orig)
+    mape_total = mape_original_scale(X_total_orig, X_recon_total_orig)
+
+    last_train = history["train_loss"][-1] if history["train_loss"] else float("nan")
+    last_val = history["val_loss"][-1] if history["val_loss"] else float("nan")
+
+    print(
+        f"  train_loss: {last_train:.6f}"
+        f"  |  MAPE (original scale)  Train: {mape_train:.4f}%  Test: {mape_test:.4f}%  Total: {mape_total:.4f}%"
+    )
+
+    if use_paper_split:
+        print("  Nota: split del paper activo -- 4500 muestras VAE, 500 red latente.")
+
+    save_model = str(config["save_model"])
+    if save_model:
+        if save_model.lower().endswith(".pt"):
+            saved_path = save_model[:-3] + f"_{name}.pt"
+        else:
+            saved_path = os.path.join(save_model, f"vae_{name}.pt")
+        trainer.save(saved_path)
+        print(f"  Modelo guardado en: {saved_path}")
+
+    return {
+        "name": name,
+        "n_train": int(len(X_tr_eval)),
+        "n_test": int(len(X_te_eval)),
+        "series_length": series_length,
+        "mape_train": mape_train,
+        "mape_test": mape_test,
+        "mape_total": mape_total,
+        "train_loss": last_train,
+        "val_loss": last_val,
+    }
