@@ -1,14 +1,23 @@
 import numpy as np
 import pandas as pd
 from Dynamic_Time_Warping import dtw_distance, compute_dtw_matrix, compute_dtw_test_matrix
+from clasificador import ClasificadorSeriesTiempo
+from dtaidistance import dtw
+
 def convert_ts(path):
-    df_X = pd.read_csv(path+'_TRAIN.tsv', sep="\t")
-    train = df_X.values
+    df_train = pd.read_csv(path + '_TRAIN.tsv', sep="\t", header=None)
+    df_test  = pd.read_csv(path + '_TEST.tsv', sep="\t", header=None)
 
-    df_Y = pd.read_csv(path+'_TEST.tsv', sep="\t")
-    test = df_Y.values
+    y_train = df_train.iloc[:, 0].values
+    X_train = df_train.iloc[:, 1:].values
 
-    return train, test
+    y_test = df_test.iloc[:, 0].values
+    X_test = df_test.iloc[:, 1:].values
+
+    X_full = np.vstack([X_train, X_test])
+    y_full = np.concatenate([y_train, y_test])
+
+    return X_full, y_full
 
 
 def NMC(mu, sigma, tau=None):
@@ -41,7 +50,6 @@ def NMC(mu, sigma, tau=None):
 
     return A
 
-import numpy as np
 
 def transform_networks(A, lamb, return_tangent=True):
     """
@@ -102,8 +110,6 @@ def transform_networks(A, lamb, return_tangent=True):
 if __name__ == "__main__":  
     datasets = [
         "ArrowHead",
-        "Beef",
-        "BirdChicken",
         "CBF",
         "CinCECGTorso",
         "Computers",
@@ -113,19 +119,14 @@ if __name__ == "__main__":
         "Earthquakes",
         "ECG5000",
         "ElectricDevices",
-        "FaceFour",
         "Fish",
         "FordB",
         "Ham",
-        "Herring",
         "InsectWingbeatSound",
         "LargeKitchenAppliances",
-        "Lightning7",
-        "Meat",
         "MiddlePhalanxOutlineAgeGroup",
         "MiddlePhalanxTW",
         "NonInvasiveFetalECGThorax1",
-        "OliveOil",
         "PhalangesOutlinesCorrect",
         "Plane",
         "ProximalPhalanxOutlineCorrect",
@@ -140,11 +141,34 @@ if __name__ == "__main__":
         "TwoLeadECG",
         "UWaveGestureLibraryY",
         "UWaveGestureLibraryAll",
-        "Wine",
         "Worms",
         "Yoga"
     ]
+    
+    classifier_dtw = ClasificadorSeriesTiempo(usar_precomputada=True)
+    classifier_euc = ClasificadorSeriesTiempo(usar_precomputada=False)
+
+
+
 
     
+    for data in datasets:
+        print(data)
+        x, y = convert_ts('UCRArchive_2018/'+data+'/'+data)
 
 
+        D = dtw.distance_matrix_fast(
+                                        x,
+                                        parallel=True,     
+                                        use_c=True,
+                                        compact=False         
+                                    )
+
+        metrics_timeseries = classifier_dtw.kfold_tuning(x, y)
+    
+        metrics_dtw = classifier_euc.kfold_tuning(D, y)
+        
+        #metrics_latent = classifier.kfold_tuning(x, y)
+
+
+        
