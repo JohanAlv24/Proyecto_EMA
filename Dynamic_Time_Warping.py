@@ -28,3 +28,4 @@ def compute_dtw_test_matrix(X_test, X_train, normalize=False):
             D[i, j] = dtw_distance(X_test[i], X_train[j], normalize)
     
     return D
+

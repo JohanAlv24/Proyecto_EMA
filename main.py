@@ -1,14 +1,55 @@
 import numpy as np
 import pandas as pd
-from Dynamic_Time_Warping import dtw_distance, compute_dtw_matrix, compute_dtw_test_matrix
+from clasificador import ClasificadorSeriesTiempo
+from dtaidistance import dtw
+import time
+
+def exportar_resultados_excel(lista_resultados, nombre_archivo="resultados.xlsx"):
+    filas = []
+
+    for r in lista_resultados:
+        fila = {
+            # KNN
+            "k": r["KNN"]["k"],
+            "knn_accuracy_mean": r["KNN"]["accuracy_mean"],
+            "knn_accuracy_std": r["KNN"]["accuracy_std"],
+            "knn_precision_mean": r["KNN"]["precision_mean"],
+            "knn_precision_std": r["KNN"]["precision_std"],
+            "knn_recall_mean": r["KNN"]["recall_mean"],
+            "knn_recall_std": r["KNN"]["recall_std"],
+
+            # SVM
+            "gamma": r["SVM"]["gamma"],
+            "svm_accuracy_mean": r["SVM"]["accuracy_mean"],
+            "svm_accuracy_std": r["SVM"]["accuracy_std"],
+            "svm_precision_mean": r["SVM"]["precision_mean"],
+            "svm_precision_std": r["SVM"]["precision_std"],
+            "svm_recall_mean": r["SVM"]["recall_mean"],
+            "svm_recall_std": r["SVM"]["recall_std"],
+        }
+
+        filas.append(fila)
+
+    df = pd.DataFrame(filas)
+
+    # Exportar
+    df.to_excel(nombre_archivo, index=False)
+
+
 def convert_ts(path):
-    df_X = pd.read_csv(path+'_TRAIN.tsv', sep="\t")
-    train = df_X.values
+    df_train = pd.read_csv(path + '_TRAIN.tsv', sep="\t", header=None)
+    df_test  = pd.read_csv(path + '_TEST.tsv', sep="\t", header=None)
 
-    df_Y = pd.read_csv(path+'_TEST.tsv', sep="\t")
-    test = df_Y.values
+    y_train = df_train.iloc[:, 0].values
+    X_train = df_train.iloc[:, 1:].values
 
-    return train, test
+    y_test = df_test.iloc[:, 0].values
+    X_test = df_test.iloc[:, 1:].values
+
+    X_full = np.vstack([X_train, X_test])
+    y_full = np.concatenate([y_train, y_test])
+
+    return X_full, y_full
 
 
 def NMC(mu, sigma, tau=None):
@@ -41,7 +82,6 @@ def NMC(mu, sigma, tau=None):
 
     return A
 
-import numpy as np
 
 def transform_networks(A, lamb, return_tangent=True):
     """
@@ -101,9 +141,8 @@ def transform_networks(A, lamb, return_tangent=True):
 
 if __name__ == "__main__":  
     datasets = [
+        "ElectricDevices",
         "ArrowHead",
-        "Beef",
-        "BirdChicken",
         "CBF",
         "CinCECGTorso",
         "Computers",
@@ -112,20 +151,14 @@ if __name__ == "__main__":
         "DistalPhalanxOutlineCorrect",
         "Earthquakes",
         "ECG5000",
-        "ElectricDevices",
-        "FaceFour",
         "Fish",
         "FordB",
         "Ham",
-        "Herring",
         "InsectWingbeatSound",
         "LargeKitchenAppliances",
-        "Lightning7",
-        "Meat",
         "MiddlePhalanxOutlineAgeGroup",
         "MiddlePhalanxTW",
         "NonInvasiveFetalECGThorax1",
-        "OliveOil",
         "PhalangesOutlinesCorrect",
         "Plane",
         "ProximalPhalanxOutlineCorrect",
@@ -140,11 +173,56 @@ if __name__ == "__main__":
         "TwoLeadECG",
         "UWaveGestureLibraryY",
         "UWaveGestureLibraryAll",
-        "Wine",
         "Worms",
         "Yoga"
     ]
+    
+    classifier_dtw = ClasificadorSeriesTiempo(usar_precomputada=True)
+    classifier_euc = ClasificadorSeriesTiempo(usar_precomputada=False)
 
+    metrics_timeseries = []
+    metrics_dtw = []
+    metrics_latent = []
+
+    
+    for data in datasets:
+        print(data)
+        init = time.time()
+        x, y = convert_ts('UCRArchive_2018/'+data+'/'+data)
+
+        print(x.shape)
+
+        D = dtw.distance_matrix_fast(
+                                        x,
+                                        parallel=True,     
+                                        use_c=True,
+                                        compact=False         
+                                    )
+        D = np.nan_to_num(D, nan=0.0, posinf=1e10)
+        end = time.time()
+
+        print(end-init)
+
+        init = time.time()
+        m_ts = classifier_euc.kfold_tuning(x, y)
+        m_ts['Dataset'] = data
+        metrics_timeseries.append(m_ts)
+    
+
+        m_dtw = classifier_dtw.kfold_tuning(D, y)
+        m_dtw['Dataset'] = data
+        metrics_dtw.append(m_dtw)
+        
+        end = time.time()
+
+        print(end-init)
+        #m_latent = classifier_euc.kfold_tuning(D, y)
+        #m_latent['Dataset'] = data
+        #metrics_latent.append(classifier_euc.kfold_tuning(x, y))
+    
+    exportar_resultados_excel(metrics_timeseries, nombre_archivo="Metricas_series_sin_transformar.xlsx")
+    exportar_resultados_excel(metrics_dtw, nombre_archivo="Metricas_dtw.xlsx")
     
 
 
+        

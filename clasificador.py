@@ -4,7 +4,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-
+from sklearn.model_selection import StratifiedKFold
+from joblib import Parallel, delayed
 from Dynamic_Time_Warping import compute_dtw_matrix, compute_dtw_test_matrix
 
 
@@ -23,10 +24,10 @@ class ClasificadorSeriesTiempo:
             self.knn = KNeighborsClassifier(n_neighbors=n_vecinos)
             self.svm = SVC(kernel='rbf')
 
-        self.arbol = DecisionTreeClassifier()
 
     def transformar_a_kernel(self, matriz_distancias):
-        return np.exp(-self.gamma_svm * matriz_distancias)
+
+        return np.exp(-self.gamma_svm * np.clip(matriz_distancias, 0, 1e6))
 
     def entrenar(self, X_entrenamiento, y_entrenamiento, X_original=None):
 
@@ -34,9 +35,6 @@ class ClasificadorSeriesTiempo:
             self.knn.fit(X_entrenamiento, y_entrenamiento)
             K_entrenamiento = self.transformar_a_kernel(X_entrenamiento)
             self.svm.fit(K_entrenamiento, y_entrenamiento)
-            if X_original is None:
-                raise ValueError("Se requiere X_original para el árbol.")
-            self.arbol.fit(X_original, y_entrenamiento)
 
         else:
             self.knn.fit(X_entrenamiento, y_entrenamiento)
@@ -49,16 +47,13 @@ class ClasificadorSeriesTiempo:
             pred_knn = self.knn.predict(X_prueba)
             K_prueba = self.transformar_a_kernel(X_prueba)
             pred_svm = self.svm.predict(K_prueba)
-            if X_original_prueba is None:
-                raise ValueError("Se requiere X_original_prueba para el árbol.")
-            pred_arbol = self.arbol.predict(X_original_prueba)
 
         else:
             pred_knn = self.knn.predict(X_prueba)
             pred_svm = self.svm.predict(X_prueba)
             pred_arbol = self.arbol.predict(X_prueba)
 
-        return pred_knn, pred_svm, pred_arbol
+        return pred_knn, pred_svm
 
     def _metricas(self, y_true, y_pred):
 
@@ -74,9 +69,127 @@ class ClasificadorSeriesTiempo:
         }
     def evaluar(self, X_prueba, y_prueba, X_original_prueba=None):
 
-        pred_knn, pred_svm, pred_arbol = self.predecir(X_prueba, X_original_prueba)
+        pred_knn, pred_svm = self.predecir(X_prueba, X_original_prueba)
         return {
             "KNN": self._metricas(y_prueba, pred_knn),
-            "SVM": self._metricas(y_prueba, pred_svm),
-            "Arbol": self._metricas(y_prueba, pred_arbol)
+            "SVM": self._metricas(y_prueba, pred_svm)
         }
+
+    def kfold_tuning(self, X, y, lista_k=[1,3,5], lista_gamma=None, n_splits=5):
+
+        if lista_gamma is None:
+            if self.usar_precomputada:
+                gamma_base = 1 / (np.median(X[X > 0]) + 1e-8)
+                lista_gamma = gamma_base * np.array([0.5, 1, 2])
+            else:
+                lista_gamma = [0.01, 0.1, 1]
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        def evaluar_config(k, gamma):
+
+            acc_knn_folds = []
+            acc_svm_folds = []
+
+            pre_knn_folds = []
+            pre_svm_folds = []
+
+            rec_knn_folds = []
+            rec_svm_folds = []
+
+            for train_idx, test_idx in skf.split(X, y):
+
+                if self.usar_precomputada:
+                    D_train = X[np.ix_(train_idx, train_idx)]
+                    D_test  = X[np.ix_(test_idx, train_idx)]
+
+                    y_train = y[train_idx]
+                    y_test  = y[test_idx]
+
+                    # --- KNN ---
+                    knn = KNeighborsClassifier(n_neighbors=k, metric='precomputed')
+                    knn.fit(D_train, y_train)
+                    pred_knn = knn.predict(D_test)
+
+                    # --- SVM ---
+                    K_train = np.exp(-gamma * D_train)
+                    K_test  = np.exp(-gamma * D_test)
+
+                    svm = SVC(kernel='precomputed')
+                    svm.fit(K_train, y_train)
+                    pred_svm = svm.predict(K_test)
+
+                else:
+                    X_train, X_test = X[train_idx], X[test_idx]
+                    y_train, y_test = y[train_idx], y[test_idx]
+
+                    # --- KNN ---
+                    knn = KNeighborsClassifier(n_neighbors=k)
+                    knn.fit(X_train, y_train)
+                    pred_knn = knn.predict(X_test)
+
+                    # --- SVM ---
+                    svm = SVC(kernel='rbf', gamma=gamma)
+                    svm.fit(X_train, y_train)
+                    pred_svm = svm.predict(X_test)
+
+                knn_met = self._metricas(y_test, pred_knn)
+                svm_met = self._metricas(y_test, pred_svm)
+
+                acc_knn_folds.append(knn_met['accuracy'])
+                acc_svm_folds.append(knn_met['accuracy'])
+
+                pre_knn_folds.append(knn_met['precision'])
+                pre_svm_folds.append(svm_met['precision'])
+
+                rec_knn_folds.append(knn_met['recall'])
+                rec_svm_folds.append(svm_met['recall'])
+
+            return {
+                "k": k,
+                "gamma": gamma,
+                "knn_scores": [acc_knn_folds, pre_knn_folds, rec_knn_folds],
+                "svm_scores": [acc_svm_folds, pre_svm_folds, rec_svm_folds],
+                "acc_knn_mean": np.mean(acc_knn_folds),
+                "acc_svm_mean": np.mean(acc_svm_folds),
+                "pre_knn_mean": np.mean(pre_knn_folds),
+                "pre_svm_mean": np.mean(pre_svm_folds),
+                "rec_knn_mean": np.mean(rec_knn_folds),
+                "rec_svm_mean": np.mean(rec_svm_folds)
+                
+            }
+
+        resultados = Parallel(n_jobs=6)(
+            delayed(evaluar_config)(k, g)
+            for k in lista_k
+            for g in lista_gamma
+        )
+
+        mejor_knn = max(resultados, key=lambda x: x["acc_knn_mean"])
+        mejor_svm = max(resultados, key=lambda x: x["acc_svm_mean"])
+
+        metricas_knn = {
+            "k": mejor_knn["k"],
+            "accuracy_mean": mejor_knn["acc_knn_mean"],
+            "accuracy_std": np.std(mejor_knn["knn_scores"][0]),
+            "precision_mean": mejor_knn["pre_knn_mean"],
+            "precision_std": np.std(mejor_knn["knn_scores"][1]),
+            "recall_mean": mejor_knn["rec_knn_mean"],
+            "recall_std": np.std(mejor_knn["knn_scores"][2])
+        }
+
+        metricas_svm = {
+            "gamma": mejor_svm["gamma"],
+            "accuracy_mean": mejor_svm["acc_svm_mean"],
+            "accuracy_std": np.std(mejor_svm["svm_scores"][0]),
+            "precision_mean": mejor_svm["pre_svm_mean"],
+            "precision_std": np.std(mejor_svm["svm_scores"][1]),
+            "recall_mean": mejor_svm["rec_svm_mean"],
+            "recall_std": np.std(mejor_svm["svm_scores"][2])
+        }
+
+        return {
+            "KNN": metricas_knn,
+            "SVM": metricas_svm
+        }
+        
