@@ -15,6 +15,7 @@ Design choices to match the paper as closely as possible:
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -24,6 +25,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -35,8 +37,9 @@ __all__ = [
     "preprocess_ucr_series",
     "build_global_ucr_matrix",
     "build_ecg5000_paper_split",
-    "mean_absolute_percentage_error",
-    "mape_original_scale",
+    "smape",
+    "mae_original_scale",
+    "rmse_original_scale",
     "train_single_dataset"
 ]
 
@@ -176,20 +179,12 @@ def preprocess_ucr_series(X: np.ndarray, target_length: int) -> np.ndarray:
     return _preprocess(X, target_length)
 
 
-def mean_absolute_percentage_error(
+def smape(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     epsilon: float = 1e-8,
 ) -> float:
-    """Compute Symmetric MAPE (sMAPE %) using per-series averaging.
-    
-    sMAPE formula: 2 * |y_true - y_pred| / (|y_true| + |y_pred|)
-    Range: [0, 200%] — stable near zero, no denominador explosion.
-    
-    Each series gets one sMAPE value by averaging along time, and the final value
-    is the mean across all series.
-    """
-
+    """Compute sMAPE (%) with per-series averaging then global mean."""
     y_true_arr = np.asarray(y_true, dtype=np.float32)
     y_pred_arr = np.asarray(y_pred, dtype=np.float32)
 
@@ -205,34 +200,18 @@ def mean_absolute_percentage_error(
     if y_true_arr.shape[0] == 0:
         return float("nan")
 
-    numerator =  np.abs(y_true_arr - y_pred_arr)
+    numerator = np.abs(y_true_arr - y_pred_arr)
     denominator = np.abs(y_true_arr) + np.abs(y_pred_arr) + epsilon
     per_point = numerator / denominator
     per_series = per_point.mean(axis=1)
-    return float(per_series.mean() * 100.0)
+    return float(per_series.mean() * 200.0)
 
 
-def mape_original_scale(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    epsilon: float = 1e-8,
-) -> float:
-    """Compute MAPE (Mean Absolute Percentage Error) in original scale.
-    
-    MAPE formula: 100 * mean(|y_true - y_pred| / (|y_true| + epsilon))
-    Stable for values near zero with epsilon regularization.
-    
-    Args:
-        y_true: Ground truth in original scale, shape (n_series, series_length).
-        y_pred: Predictions in original scale, shape (n_series, series_length).
-        epsilon: Small constant to avoid division by zero.
-    
-    Returns:
-        MAPE percentage value.
-    """
+def mae_original_scale(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute MAE in original scale with per-series averaging then global mean."""
     y_true_arr = np.asarray(y_true, dtype=np.float32)
     y_pred_arr = np.asarray(y_pred, dtype=np.float32)
-    
+
     if y_true_arr.shape != y_pred_arr.shape:
         raise ValueError(
             f"y_true and y_pred must have the same shape, got "
@@ -244,12 +223,31 @@ def mape_original_scale(
         )
     if y_true_arr.shape[0] == 0:
         return float("nan")
-    
-    numerator = np.abs(y_true_arr - y_pred_arr)
-    denominator = np.abs(y_true_arr) + epsilon
-    per_point = numerator / denominator
+
+    per_point = np.abs(y_true_arr - y_pred_arr)
     per_series = per_point.mean(axis=1)
-    return float(per_series.mean() * 100.0)
+    return float(per_series.mean())
+
+
+def rmse_original_scale(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute RMSE in original scale with per-series averaging then global mean."""
+    y_true_arr = np.asarray(y_true, dtype=np.float32)
+    y_pred_arr = np.asarray(y_pred, dtype=np.float32)
+
+    if y_true_arr.shape != y_pred_arr.shape:
+        raise ValueError(
+            f"y_true and y_pred must have the same shape, got "
+            f"{y_true_arr.shape} and {y_pred_arr.shape}"
+        )
+    if y_true_arr.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D arrays (n_series, series_length), got {y_true_arr.ndim}-D"
+        )
+    if y_true_arr.shape[0] == 0:
+        return float("nan")
+
+    per_series = np.sqrt(((y_true_arr - y_pred_arr) ** 2).mean(axis=1))
+    return float(per_series.mean())
 
 
 def build_global_ucr_matrix(
@@ -335,6 +333,67 @@ def build_ecg5000_paper_split(
     X_latent = X_all[train_size:total_required]
     y_latent = y_all[train_size:total_required]
     return X_vae, y_vae, X_latent, y_latent
+
+
+def _stratified_folds(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int,
+    seed: int,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Return all (train_idx, val_idx) pairs produced by StratifiedKFold."""
+
+    if n_splits < 2:
+        raise ValueError("n_splits must be >= 2")
+    if X.shape[0] != len(y):
+        raise ValueError(
+            f"X and y must have the same number of samples, got {X.shape[0]} and {len(y)}"
+        )
+
+    _, counts = np.unique(np.asarray(y), return_counts=True)
+    if counts.size == 0:
+        raise ValueError("y must contain at least one class")
+    min_count = int(counts.min())
+    if min_count < n_splits:
+        raise ValueError(
+            f"Each class must have at least {n_splits} samples for StratifiedKFold; "
+            f"smallest class has {min_count}"
+        )
+
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return list(splitter.split(X, y))
+
+
+def _save_latent_statistics_csv(
+    path: str,
+    series_names: List[str],
+    mu_values: np.ndarray,
+    sigma2_values: np.ndarray,
+) -> None:
+    """Save full latent vectors per sample to CSV."""
+
+    if mu_values.ndim != 2 or sigma2_values.ndim != 2:
+        raise ValueError("mu_values and sigma2_values must be 2-D arrays")
+    if mu_values.shape != sigma2_values.shape:
+        raise ValueError(
+            f"mu_values and sigma2_values must have the same shape, got {mu_values.shape} and {sigma2_values.shape}"
+        )
+    if len(series_names) != int(mu_values.shape[0]):
+        raise ValueError(
+            f"series_names length must match number of samples, got {len(series_names)} and {mu_values.shape[0]}"
+        )
+
+    df = pd.DataFrame(
+        {
+            "series_name": series_names,
+            "mu_vector": [json.dumps(row.tolist()) for row in mu_values],
+            "var_vector": [json.dumps(row.tolist()) for row in sigma2_values],
+        }
+    )
+
+    out_dir = os.path.dirname(os.path.abspath(path)) or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    df.to_csv(path, index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -565,12 +624,13 @@ class VAETrainer:
     def fit(
         self,
         X: np.ndarray,
-        epochs: int = 50,
+        epochs: int = 100,
         batch_size: int = 64,
         val_split: float = 0.1,
         verbose: bool = True,
         early_stopping_patience: int = 0,
         kl_warmup_epochs: int = 25,
+        X_val: Optional[np.ndarray] = None,
     ) -> Dict[str, list]:
         """Train the VAE on a numpy array of pre-processed time series.
         
@@ -582,6 +642,7 @@ class VAETrainer:
             verbose: Whether to print training progress.
             early_stopping_patience: Number of epochs with no improvement to stop. 0 disables.
             kl_warmup_epochs: Number of epochs to linearly warm up KL term (default 25).
+            X_val: Optional fixed validation set. If provided, val_split is ignored.
         """
 
         if X.ndim != 2 or X.shape[1] != self.model.config.input_length:
@@ -591,21 +652,30 @@ class VAETrainer:
             )
 
         X_t = torch.from_numpy(X.astype(np.float32))
-        n_val = max(1, int(len(X_t) * val_split)) if val_split > 0.0 else 0
-        n_train = len(X_t) - n_val
-        if n_train < 1:
-            raise ValueError("Not enough samples for training after val split.")
+        if X_val is not None:
+            X_val_arr = np.asarray(X_val, dtype=np.float32)
+            if X_val_arr.ndim != 2 or X_val_arr.shape[1] != self.model.config.input_length:
+                raise ValueError(
+                    f"X_val must have shape (n_samples, {self.model.config.input_length}), got {X_val_arr.shape}"
+                )
+            X_train = X_t
+            X_val_t = torch.from_numpy(X_val_arr)
+        else:
+            n_val = max(1, int(len(X_t) * val_split)) if val_split > 0.0 else 0
+            n_train = len(X_t) - n_val
+            if n_train < 1:
+                raise ValueError("Not enough samples for training after val split.")
 
-        idx = torch.randperm(len(X_t))
-        X_train = X_t[idx[:n_train]]
-        X_val = X_t[idx[n_train:]] if n_val > 0 else None
+            idx = torch.randperm(len(X_t))
+            X_train = X_t[idx[:n_train]]
+            X_val_t = X_t[idx[n_train:]] if n_val > 0 else None
 
         train_loader = DataLoader(
             TensorDataset(X_train), batch_size=batch_size, shuffle=True
         )
         val_loader = (
-            DataLoader(TensorDataset(X_val), batch_size=batch_size, shuffle=False)
-            if X_val is not None
+            DataLoader(TensorDataset(X_val_t), batch_size=batch_size, shuffle=False)
+            if X_val_t is not None
             else None
         )
 
@@ -667,16 +737,43 @@ class VAETrainer:
             return np.empty((0, expected_len), dtype=np.float32)
         return np.concatenate(recon_parts, axis=0).astype(np.float32)
 
-    def reconstruction_mape(
+    def collect_latent_statistics(
         self,
         X: np.ndarray,
         batch_size: int = 256,
-        epsilon: float = 1e-8,
-    ) -> float:
-        """Compute MAPE (%) between X and its VAE reconstruction."""
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect latent means and variances for a dataset."""
 
-        X_recon = self.reconstruct(X, batch_size=batch_size)
-        return mean_absolute_percentage_error(X, X_recon, epsilon=epsilon)
+        expected_len = self.model.config.input_length
+        if X.ndim != 2 or X.shape[1] != expected_len:
+            raise ValueError(
+                f"X must have shape (n_samples, {expected_len}), got {X.shape}"
+            )
+
+        dataset = TensorDataset(torch.from_numpy(X.astype(np.float32)))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        self.model.eval()
+        mu_parts: List[np.ndarray] = []
+        sigma2_parts: List[np.ndarray] = []
+        with torch.no_grad():
+            for (batch,) in loader:
+                batch = batch.to(self.device)
+                if batch.dim() == 2:
+                    batch = batch.unsqueeze(1)
+                mu, sigma = self.model.encode(batch)
+                mu_parts.append(mu.cpu().numpy())
+                sigma2_parts.append(sigma.pow(2).cpu().numpy())
+
+        if not mu_parts:
+            return np.empty((0, self.model.config.latent_dim), dtype=np.float32), np.empty(
+                (0, self.model.config.latent_dim), dtype=np.float32
+            )
+
+        return (
+            np.concatenate(mu_parts, axis=0).astype(np.float32),
+            np.concatenate(sigma2_parts, axis=0).astype(np.float32),
+        )
 
     # ------------------------------------------------------------------
     # Persistence
@@ -739,7 +836,7 @@ def train_single_dataset(
     """Entrena un VAE sobre un único dataset UCR y devuelve sus métricas en escala original."""
     import torch
 
-    X_tr, _, X_te, _ = load_ucr_dataset(name, archive_path)
+    X_tr, y_tr, X_te, y_te = load_ucr_dataset(name, archive_path)
     natural_length = int(X_tr.shape[1])
     target_length = int(config["target_length"])
     series_length = min(target_length, natural_length) if target_length > 0 else natural_length
@@ -761,7 +858,7 @@ def train_single_dataset(
     use_paper_split = bool(config["paper_ecg5000_split"]) and name == "ECG5000"
     if use_paper_split:
         paper_len = min(series_length, 140)
-        X_train_arr, _, _, _ = build_ecg5000_paper_split(
+        X_train_arr, y_train_arr, _, _ = build_ecg5000_paper_split(
             archive_path=archive_path,
             target_length=paper_len,
             seed=seed,
@@ -779,12 +876,34 @@ def train_single_dataset(
         X_te_eval = X_te_norm
         if bool(config["use_test"]):
             X_train_arr = np.concatenate([X_tr_eval, X_te_eval], axis=0)
+            y_train_arr = np.concatenate([y_tr, y_te], axis=0)
         else:
             X_train_arr = X_tr_eval
+            y_train_arr = y_tr
+
+    use_stratified_kfold = bool(config.get("stratified_kfold", False))
+    kfold_splits = int(config.get("kfold_splits", 3))
+    folds_idx: List[Tuple[np.ndarray, np.ndarray]] = []
+
+    if bool(config.get("use_test")) and use_stratified_kfold and not use_paper_split:
+        try:
+            folds_idx = _stratified_folds(
+                X_train_arr,
+                y_train_arr,
+                n_splits=kfold_splits,
+                seed=seed,
+            )
+            print(f"  StratifiedKFold completo activo: n_splits={kfold_splits}")
+        except ValueError as exc:
+            print(f"  Aviso: no se pudo usar StratifiedKFold ({exc}). Se usará split aleatorio interno.")
+
+    latent_dim = max(2, min(len(X_train_arr) // 20, 20))
+    config["latent_dim"] = latent_dim
 
     print(
         f"  Longitud de serie: {series_length} (natural: {natural_length})"
-        f"  |  Train: {len(X_train_arr)}  |  Test: {len(X_te_eval)}"
+        f"  |  Train pool: {len(X_train_arr)}  |  Test: {len(X_te_eval)}"
+        f"  |  latent_dim: {latent_dim}"
     )
 
     np.random.seed(seed)
@@ -792,64 +911,155 @@ def train_single_dataset(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    cfg = TimeSeriesVAEConfig(
-        input_length=series_length,
-        latent_dim=int(config["latent_dim"]),
-        hidden_size=int(config["hidden_size"]),
-        num_layers=int(config["num_layers"]),
-        beta=float(config["beta"]),
-    )
-    model = TimeSeriesVAE(cfg)
-    trainer = VAETrainer(
-        model=model,
-        learning_rate=float(config["learning_rate"]),
-        device=device,
-    )
+    train_losses: List[float] = []
+    val_losses: List[float] = []
+    smape_train_vals: List[float] = []
+    smape_test_vals: List[float] = []
+    mae_train_vals: List[float] = []
+    mae_test_vals: List[float] = []
+    rmse_train_vals: List[float] = []
+    rmse_test_vals: List[float] = []
+    n_train_used_vals: List[int] = []
+    best_fold_num = 0
+    best_mae_test = float("inf")
+    best_trainer: Optional[VAETrainer] = None
+    best_train_data: Optional[np.ndarray] = None
+    best_train_indices: Optional[np.ndarray] = None
 
-    history = trainer.fit(
-        X_train_arr,
-        epochs=int(config["epochs"]),
-        batch_size=int(config["batch_size"]),
-        val_split=float(config["val_split"]),
-        verbose=True,
-        early_stopping_patience=int(config["early_stopping_patience"]),
-        kl_warmup_epochs=25,  # Default warm-up schedule
-    )
+    if folds_idx:
+        fold_specs = [
+            (X_train_arr[tr_idx], X_train_arr[val_idx], tr_idx)
+            for tr_idx, val_idx in folds_idx
+        ]
+    else:
+        fold_specs = [
+            (
+                X_train_arr,
+                None,
+                np.arange(len(X_train_arr), dtype=np.int64),
+            )
+        ]
 
-    batch = int(config["batch_size"])
-    
-    # Reconstruct in normalized space
-    X_recon_tr_norm = trainer.reconstruct(X_tr_eval, batch_size=batch)
-    X_recon_te_norm = trainer.reconstruct(X_te_eval, batch_size=batch)
-    X_total_norm = np.concatenate([X_tr_eval, X_te_eval], axis=0)
-    X_recon_total_norm = trainer.reconstruct(X_total_norm, batch_size=batch)
+    save_model = str(config["save_model"])
 
-    # Denormalize reconstructions and originals to original scale
-    X_tr_orig = X_tr_orig_padded  # Original scale, padded
-    X_te_orig = X_te_orig_padded
-    X_recon_tr_orig = _unzscore(X_recon_tr_norm, means_tr, stds_tr)
-    X_recon_te_orig = _unzscore(X_recon_te_norm, means_te, stds_te)
-    X_total_orig = np.concatenate([X_tr_orig, X_te_orig], axis=0)
-    X_recon_total_orig = np.concatenate([X_recon_tr_orig, X_recon_te_orig], axis=0)
+    for fold_num, (X_train_fit, X_val_fit, train_idx) in enumerate(fold_specs, start=1):
+        if X_val_fit is not None:
+            print(
+                f"  Fold [{fold_num}/{len(fold_specs)}]"
+                f"  |  train: {len(X_train_fit)}  |  val: {len(X_val_fit)}"
+            )
 
-    # Calculate MAPE in original scale
-    mape_train = mape_original_scale(X_tr_orig, X_recon_tr_orig)
-    mape_test = mape_original_scale(X_te_orig, X_recon_te_orig)
-    mape_total = mape_original_scale(X_total_orig, X_recon_total_orig)
+        cfg = TimeSeriesVAEConfig(
+            input_length=series_length,
+            latent_dim=latent_dim,
+            hidden_size=int(config["hidden_size"]),
+            num_layers=int(config["num_layers"]),
+            beta=float(config["beta"]),
+        )
+        model = TimeSeriesVAE(cfg)
+        trainer = VAETrainer(
+            model=model,
+            learning_rate=float(config["learning_rate"]),
+            device=device,
+        )
 
-    last_train = history["train_loss"][-1] if history["train_loss"] else float("nan")
-    last_val = history["val_loss"][-1] if history["val_loss"] else float("nan")
+        history = trainer.fit(
+            X_train_fit,
+            epochs=int(config["epochs"]),
+            batch_size=int(config["batch_size"]),
+            val_split=float(config["val_split"]),
+            verbose=True,
+            early_stopping_patience=int(config["early_stopping_patience"]),
+            kl_warmup_epochs=25,  # Default warm-up schedule
+            X_val=X_val_fit,
+        )
+
+        if save_model and len(fold_specs) > 1:
+            if save_model.lower().endswith(".pt"):
+                fold_saved_path = save_model[:-3] + f"_{name}_fold{fold_num}.pt"
+            else:
+                fold_saved_path = os.path.join(save_model, f"vae_{name}_fold{fold_num}.pt")
+            trainer.save(fold_saved_path)
+            print(f"  Modelo fold {fold_num} guardado en: {fold_saved_path}")
+
+        batch = int(config["batch_size"])
+
+        # Reconstruct in normalized space
+        X_recon_tr_norm = trainer.reconstruct(X_tr_eval, batch_size=batch)
+        X_recon_te_norm = trainer.reconstruct(X_te_eval, batch_size=batch)
+
+        # Denormalize reconstructions and originals to original scale
+        X_tr_orig = X_tr_orig_padded  # Original scale, padded
+        X_te_orig = X_te_orig_padded
+        X_recon_tr_orig = _unzscore(X_recon_tr_norm, means_tr, stds_tr)
+        X_recon_te_orig = _unzscore(X_recon_te_norm, means_te, stds_te)
+
+        smape_train_vals.append(smape(X_tr_orig, X_recon_tr_orig))
+        smape_test_vals.append(smape(X_te_orig, X_recon_te_orig))
+        mae_train_vals.append(mae_original_scale(X_tr_orig, X_recon_tr_orig))
+        mae_test_vals.append(mae_original_scale(X_te_orig, X_recon_te_orig))
+        rmse_train_vals.append(rmse_original_scale(X_tr_orig, X_recon_tr_orig))
+        rmse_test_vals.append(rmse_original_scale(X_te_orig, X_recon_te_orig))
+
+        last_train = history["train_loss"][-1] if history["train_loss"] else float("nan")
+        last_val = history["val_loss"][-1] if history["val_loss"] else float("nan")
+        train_losses.append(last_train)
+        val_losses.append(last_val)
+        n_train_used_vals.append(int(len(X_train_fit)))
+
+        current_mae_test = mae_test_vals[-1]
+        if current_mae_test < best_mae_test:
+            best_mae_test = current_mae_test
+            best_fold_num = fold_num
+            best_trainer = trainer
+            best_train_data = X_train_fit
+            best_train_indices = np.asarray(train_idx, dtype=np.int64)
+
+    smape_train = float(np.mean(smape_train_vals)) if smape_train_vals else float("nan")
+    smape_test = float(np.mean(smape_test_vals)) if smape_test_vals else float("nan")
+    mae_train = float(np.mean(mae_train_vals)) if mae_train_vals else float("nan")
+    mae_test = float(np.mean(mae_test_vals)) if mae_test_vals else float("nan")
+    rmse_train = float(np.mean(rmse_train_vals)) if rmse_train_vals else float("nan")
+    rmse_test = float(np.mean(rmse_test_vals)) if rmse_test_vals else float("nan")
+    last_train = float(np.mean(train_losses)) if train_losses else float("nan")
+    last_val = float(np.mean(val_losses)) if val_losses else float("nan")
+    n_train_used = int(np.mean(n_train_used_vals)) if n_train_used_vals else int(len(X_train_arr))
 
     print(
-        f"  train_loss: {last_train:.6f}"
-        f"  |  MAPE (original scale)  Train: {mape_train:.4f}%  Test: {mape_test:.4f}%  Total: {mape_total:.4f}%"
+        f"  Promedio ({len(fold_specs)} ejecución(es))"
+        f"  |  train_loss: {last_train:.6f}"
+        f"  |  sMAPE Train: {smape_train:.4f}%  Test: {smape_test:.4f}% | "
+        f"MAE Train: {mae_train:.6f}  Test: {mae_test:.6f} | "
+        f"RMSE Train: {rmse_train:.6f}  Test: {rmse_test:.6f}"
     )
 
     if use_paper_split:
         print("  Nota: split del paper activo -- 4500 muestras VAE, 500 red latente.")
 
-    save_model = str(config["save_model"])
-    if save_model:
+    if (
+        folds_idx
+        and best_trainer is not None
+        and best_train_data is not None
+        and best_train_indices is not None
+    ):
+        if save_model.lower().endswith(".pt"):
+            stats_path = save_model[:-3] + f"_{name}_best_fold_latent_stats.csv"
+        else:
+            stats_path = os.path.join(save_model, f"latent_stats_best_fold_{name}.csv")
+        mu_values, sigma2_values = best_trainer.collect_latent_statistics(
+            best_train_data,
+            batch_size=int(config["batch_size"]),
+        )
+        series_names = [f"{name}_serie_{int(i)}" for i in best_train_indices]
+        _save_latent_statistics_csv(
+            stats_path,
+            series_names=series_names,
+            mu_values=mu_values,
+            sigma2_values=sigma2_values,
+        )
+        print(f"  Estadisticas latentes del mejor fold guardadas en: {stats_path}")
+
+    if save_model and len(fold_specs) == 1:
         if save_model.lower().endswith(".pt"):
             saved_path = save_model[:-3] + f"_{name}.pt"
         else:
@@ -860,11 +1070,17 @@ def train_single_dataset(
     return {
         "name": name,
         "n_train": int(len(X_tr_eval)),
+        "n_train_used": n_train_used,
         "n_test": int(len(X_te_eval)),
         "series_length": series_length,
-        "mape_train": mape_train,
-        "mape_test": mape_test,
-        "mape_total": mape_total,
+        "best_fold": best_fold_num if folds_idx else 0,
+        "best_fold_mae_test": best_mae_test if folds_idx else mae_test,
+        "smape_train": smape_train,
+        "smape_test": smape_test,
+        "mae_train": mae_train,
+        "mae_test": mae_test,
+        "rmse_train": rmse_train,
+        "rmse_test": rmse_test,
         "train_loss": last_train,
         "val_loss": last_val,
     }
