@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import Dict, List
+import torch
+import ui
+from VAE import train_single_dataset
 import numpy as np
 import pandas as pd
 from clasificador import ClasificadorSeriesTiempo
@@ -139,6 +144,67 @@ def transform_networks(A, lamb, return_tangent=True):
 
     return L, Y, M
 
+def main() -> None:
+    archive_path, available = ui.get_archive_path_and_datasets()
+    
+    config = ui.collect_interactive_config(available)
+
+    datasets = config["datasets"]
+    if not isinstance(datasets, list):
+        raise ValueError("Error interno: datasets inválidos.")
+
+    device = str(config["device"])
+    if device not in {"auto", "cpu", "cuda"}:
+        print("Dispositivo inválido, se usará 'auto'.")
+        device = "auto"
+
+    seed = int(config["seed"])
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    target_display = int(config["target_length"])
+    print("\nConfiguracion del experimento")
+    print(f"  archive_path  : {archive_path}")
+    print(f"  datasets      : {datasets}  ({len(datasets)} dataset(s))")
+    print(f"  modo_todos    : {config['run_all']}")
+    print(f"  target_length : {'auto (longitud natural)' if target_display == 0 else target_display}")
+    print(
+        f"  hidden_size={config['hidden_size']},  num_layers={config['num_layers']}"
+    )
+    print(
+        f"  epochs={config['epochs']},  batch_size={config['batch_size']},"
+        f"  lr={config['learning_rate']}"
+    )
+
+    results: List[Dict[str, object]] = []
+    for i, name in enumerate(datasets, start=1):
+        print(f"\n{'=' * 60}")
+        print(f"  [{i}/{len(datasets)}]  Entrenando dataset: {name}")
+        print(f"{'=' * 60}")
+        try:
+            result = train_single_dataset(
+                name=name,
+                archive_path=archive_path,
+                config=config,
+                device=device,
+                seed=seed,
+            )
+            results.append(result)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ERROR en dataset {name}: {exc}")
+            results.append({"name": name, "error": str(exc)})
+
+    ui.print_results_summary(results)
+
+    save_model = str(config.get("save_model", "")).strip()
+    if save_model:
+        ui.save_mae_test_data_and_plot(results, save_model)
+
+
+
+
 if __name__ == "__main__":  
     datasets = [
         "ElectricDevices",
@@ -179,6 +245,7 @@ if __name__ == "__main__":
     
     classifier_dtw = ClasificadorSeriesTiempo(usar_precomputada=True)
     classifier_euc = ClasificadorSeriesTiempo(usar_precomputada=False)
+    classifier_latent = ClasificadorSeriesTiempo(usar_precomputada=False)
 
     metrics_timeseries = []
     metrics_dtw = []
@@ -213,16 +280,18 @@ if __name__ == "__main__":
         m_dtw['Dataset'] = data
         metrics_dtw.append(m_dtw)
         
+
+        m_latent = classifier_latent.kfold_tuning(x, y)
+        m_latent['Dataset'] = data
+        metrics_latent.append(m_latent)
+
         end = time.time()
 
         print(end-init)
-        #m_latent = classifier_euc.kfold_tuning(D, y)
-        #m_latent['Dataset'] = data
-        #metrics_latent.append(classifier_euc.kfold_tuning(x, y))
     
     exportar_resultados_excel(metrics_timeseries, nombre_archivo="Metricas_series_sin_transformar.xlsx")
     exportar_resultados_excel(metrics_dtw, nombre_archivo="Metricas_dtw.xlsx")
-    
+    exportar_resultados_excel(metrics_latent, nombre_archivo="Metricas_latent.xlsx")
 
 
         
